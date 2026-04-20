@@ -13,11 +13,18 @@ class Conv2D(Layer):
         self.padding = padding
         
         # MODIFICAR: Añadir nuevo if-else para otros algoritmos de convolución
+        # conv_algo=0 -> directo con bucles (original, lento)
+        # conv_algo=1 -> directo vectorizado con NumPy (más rápido, menos bucles)
+        # conv_algo=2 -> im2col + GEMM (convolución como multiplicación de matrices)
         if conv_algo == 0:
-            self.mode = 'direct' 
+            self.mode = 'direct'
+        elif conv_algo == 1:
+            self.mode = 'direct_vectorized'
+        elif conv_algo == 2:
+            self.mode = 'im2col'
         else:
             print(f"Algoritmo {conv_algo} no soportado aún")
-            self.mode = 'direct' 
+            self.mode = 'direct'
 
         fan_in = in_channels * kernel_size * kernel_size
         fan_out = out_channels * kernel_size * kernel_size
@@ -33,12 +40,11 @@ class Conv2D(Layer):
         else:
             self.kernels = np.random.uniform(-0.1, 0.1, 
                           (out_channels, in_channels, kernel_size, kernel_size)).astype(np.float32)
-        
 
         self.biases = np.zeros(out_channels, dtype=np.float32)
 
         # PISTA: Y estos valores para qué las podemos utilizar?
-        # Si los usas, no olvides utilizar el modelo explicado en teoría que maximiza la caché
+        # Si los usas, no olvides utilizar el modelo explicado en teoría que maximiza la caché
         self.mc = 480
         self.nc = 3072
         self.kc = 384
@@ -47,21 +53,24 @@ class Conv2D(Layer):
         self.Ac = np.empty((self.mc, self.kc), dtype=np.float32)
         self.Bc = np.empty((self.kc, self.nc), dtype=np.float32)
 
-
     def get_weights(self):
         return {'kernels': self.kernels, 'biases': self.biases}
 
     def set_weights(self, weights):
         self.kernels = weights['kernels']
         self.biases = weights['biases']
-    
+
     def forward(self, input, training=True):
         self.input = input
         # PISTA: Usar estos if-else si implementas más algoritmos de convolución
         if self.mode == 'direct':
             return self._forward_direct(input)
+        elif self.mode == 'direct_vectorized':
+            return self._forward_direct_vectorized(input)
+        elif self.mode == 'im2col':
+            return self._forward_im2col(input)
         else:
-            raise ValueError("Mode must be 'direct")
+            raise ValueError("Mode not supported")
 
     def backward(self, grad_output, learning_rate):
         # ESTO NO ES NECESARIO YA QUE NO VAIS A HACER BACKPROPAGATION
@@ -71,7 +80,7 @@ class Conv2D(Layer):
             raise ValueError("Mode must be 'direct' or 'im2col'")
 
     # --- DIRECT IMPLEMENTATION ---
-
+    # Implementación original con 5 bucles anidados en Python.
     def _forward_direct(self, input):
         batch_size, _, in_h, in_w = input.shape
         k_h, k_w = self.kernel_size, self.kernel_size
@@ -98,7 +107,87 @@ class Conv2D(Layer):
 
         return output
 
+    # --- DIRECT VECTORIZED IMPLEMENTATION ---
+    # Referencia: transparencias "Convolution via Direct Algorithm - Vectorization"
+    def _forward_direct_vectorized(self, input):
+        batch_size, _, in_h, in_w = input.shape
+        k_h, k_w = self.kernel_size, self.kernel_size
+
+        if self.padding > 0:
+            input = np.pad(input,
+                           ((0, 0), (0, 0), (self.padding, self.padding), (self.padding, self.padding)),
+                           mode='constant').astype(np.float32)
+
+        out_h = (input.shape[2] - k_h) // self.stride + 1
+        out_w = (input.shape[3] - k_w) // self.stride + 1
+        output = np.zeros((batch_size, self.out_channels, out_h, out_w), dtype=np.float32)
+
+        for b in range(batch_size):
+            for out_c in range(self.out_channels):
+                for in_c in range(self.in_channels):
+                    for ki in range(k_h):
+                        for kj in range(k_w):
+                            # Multiplicamos el escalar del kernel por toda la submatriz.
+                            output[b, out_c] += self.kernels[out_c, in_c, ki, kj] * \
+                                                input[b, in_c, ki:ki+out_h, kj:kj+out_w]
+                output[b, out_c] += self.biases[out_c]
+
+        return output
+
+    # --- IM2COL + GEMM IMPLEMENTATION ---
+    # Transformamos la convolución en una multiplicación de matrices (GEMM).
+    # Referencia: transparencias "Convolution via Im2col + GEMM"
+
+    def _im2col(self, input, k_h, k_w, out_h, out_w):
+        # Coge todos los parches de la imagen y los organiza en columnas.
+        batch_size, in_channels, _, _ = input.shape
+
+        cols = np.zeros((batch_size, in_channels * k_h * k_w, out_h * out_w), dtype=np.float32)
+
+        for ki in range(k_h):
+            for kj in range(k_w):
+                for c in range(in_channels):
+                    # row_idx: en qué fila de cols va este elemento
+                    row_idx = c * k_h * k_w + ki * k_w + kj
+                    # Cogemos toda la submatriz
+                    cols[:, row_idx, :] = input[:, c,
+                                                ki:ki+out_h,
+                                                kj:kj+out_w].reshape(batch_size, -1)
+
+        return cols
+
+    def _forward_im2col(self, input):
+        batch_size, _, in_h, in_w = input.shape
+        k_h, k_w = self.kernel_size, self.kernel_size
+
+        if self.padding > 0:
+            input = np.pad(input,
+                           ((0, 0), (0, 0), (self.padding, self.padding), (self.padding, self.padding)),
+                           mode='constant').astype(np.float32)
+
+        out_h = (input.shape[2] - k_h) // self.stride + 1
+        out_w = (input.shape[3] - k_w) // self.stride + 1
+
+        # Paso 1: convertir imagen en matriz de parches
+        cols = self._im2col(input, k_h, k_w, out_h, out_w)
+
+        # Paso 2: estirar kernels de 4D a 2D
+        kernels_flat = self.kernels.reshape(self.out_channels, -1)
+
+        # Paso 3: multiplicación de matrices = convolución completa
+        output = np.zeros((batch_size, self.out_channels, out_h * out_w), dtype=np.float32)
+        for b in range(batch_size):
+            output[b] = kernels_flat @ cols[b]
+
+        output = output.reshape(batch_size, self.out_channels, out_h, out_w)
+
+        # Paso 4: añadir bias a cada canal de salida
+        output += self.biases[np.newaxis, :, np.newaxis, np.newaxis]
+
+        return output
+
     def _backward_direct(self, grad_output, learning_rate):
+        # ESTO NO ES NECESARIO YA QUE NO VAIS A HACER BACKPROPAGATION
         batch_size, _, out_h, out_w = grad_output.shape
         _, _, in_h, in_w = self.input.shape
         k_h, k_w = self.kernel_size, self.kernel_size
